@@ -1078,6 +1078,17 @@ t volumes-from-unknown "No such container: vfnosuch" bash -c "o=\$($D run --rm -
 # The anonymous volume stays while another container still uses it.
 t volumes-from-anon-kept "got:a" bash -c "$D rm -v vfsrc >/dev/null; $D run --rm --volumes-from vfdst alpine sh -c 'echo got:\$(cat /anon/f)'"
 $D rm -f -v vfsrc vfdst >/dev/null 2>&1; $D volume rm tvfrom $VFANON >/dev/null 2>&1
+# Inspect gives back the mounts as create got them, in HostConfig and in
+# Config.Volumes. Watchtower and Portainer recreate a container from its
+# inspect, and so keep its binds and volumes (#610).
+$D rm -f -v hcm hcm2 >/dev/null 2>&1
+$D run --rm -v thcm:/data alpine sh -c 'echo kept > /data/f'
+$D create --name hcm -v "$BIND:/bind:ro" -v thcm:/data -v /anon --mount type=tmpfs,target=/t --tmpfs /t2:size=1m alpine sh -c 'echo $(cat /data/f /bind/hello.txt)' >/dev/null
+# The docker CLI sends `-v` lines in no set order (a Go map): sorted here.
+t inspect-binds "$BIND:/bind:ro thcm:/data" bash -c "$D inspect -f '{{range .HostConfig.Binds}}{{.}} {{end}}' hcm | tr ' ' '\n' | LC_ALL=C sort | tr '\n' ' ' | sed 's/^ *//'"
+t inspect-mounts-tmpfs '[{"Type":"tmpfs","Target":"/t"}] {"/t2":"size=1m"} {"/anon":{}}' $D inspect -f '{{json .HostConfig.Mounts}} {{json .HostConfig.Tmpfs}} {{json .Config.Volumes}}' hcm
+t inspect-recreate "kept from the mac" bash -c "b=\$(curl -s --unix-socket '$SOCK' http://d/v1.47/containers/hcm/json | python3 -c 'import json, sys; c = json.load(sys.stdin); print(json.dumps(dict(c[\"Config\"], HostConfig=c[\"HostConfig\"])))'); curl -s -o /dev/null --unix-socket '$SOCK' -X POST -H 'Content-Type: application/json' -d \"\$b\" 'http://d/v1.47/containers/create?name=hcm2' && $D start -a hcm2"
+$D rm -f -v hcm hcm2 >/dev/null 2>&1; $D volume rm thcm >/dev/null 2>&1
 t anon-from-image "volume:/var/lib/postgresql/data" bash -c "$D run -d --name pgv -e POSTGRES_PASSWORD=x postgres:17-alpine >/dev/null; $D inspect -f '{{range .Mounts}}{{.Type}}:{{.Destination}}{{end}}' pgv"
 # Waits for the entrypoint's "init process complete" and then a working query,
 # not for pg_isready: on first start Postgres runs a temporary server to

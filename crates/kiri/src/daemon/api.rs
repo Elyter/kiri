@@ -1822,6 +1822,60 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
     Ok(out)
 }
 
+/// What inspect gives back of a create's mounts: HostConfig's `Binds`,
+/// `Mounts` and `Tmpfs` as they came, and `Volumes` (`-v /path`) with the
+/// image's VOLUME lines, as Docker's Config has them. Tools that recreate a
+/// container from its inspect (Watchtower, Portainer) copy these (#610).
+fn mount_request(body: &Value, image_cfg: &Value) -> Value {
+    let host = &body["HostConfig"];
+    let mut volumes = serde_json::Map::new();
+    for given in [&body["Volumes"], &image_cfg["config"]["Volumes"]] {
+        for path in given.as_object().into_iter().flat_map(|m| m.keys()) {
+            volumes.entry(path.clone()).or_insert_with(|| json!({}));
+        }
+    }
+    json!({
+        "Binds": host["Binds"],
+        "Mounts": host["Mounts"],
+        "Tmpfs": host["Tmpfs"],
+        "Volumes": if volumes.is_empty() { Value::Null } else { Value::Object(volumes) },
+    })
+}
+
+/// [`mount_request`] for inspect. A container saved before it was kept has
+/// only Docker's `Mounts` entries, so they are made from those: a bind or a
+/// named volume as a `Binds` line, a tmpfs in `Tmpfs`, an anonymous volume
+/// in `Volumes`. The other container's mounts that `--volumes-from` brought
+/// can't be told apart there and show in `Binds` too.
+fn inspect_mounts(spec: &Spec) -> Value {
+    if !spec.mount_request.is_null() {
+        return spec.mount_request.clone();
+    }
+    let (mut binds, mut tmpfs, mut volumes) = (Vec::new(), serde_json::Map::new(), serde_json::Map::new());
+    for m in &spec.mount_info {
+        let dst = m["Destination"].as_str().unwrap_or_default();
+        let ro = if m["RW"] == false { ":ro" } else { "" };
+        match (m["Type"].as_str(), m["Name"].as_str()) {
+            (Some("bind"), _) => binds.push(format!("{}:{dst}{ro}", m["Source"].as_str().unwrap_or_default())),
+            (Some("volume"), Some(name)) if spec.anon_volumes.iter().any(|a| a == name) => {
+                volumes.insert(dst.to_owned(), json!({}));
+            }
+            (Some("volume"), Some(name)) => binds.push(format!("{name}:{dst}{ro}")),
+            (Some("tmpfs"), _) => {
+                tmpfs.insert(dst.to_owned(), json!(""));
+            }
+            _ => {}
+        }
+    }
+    let or_null = |v: Value, empty: bool| if empty { Value::Null } else { v };
+    json!({
+        "Binds": or_null(json!(binds), binds.is_empty()),
+        "Mounts": Value::Null,
+        "Tmpfs": or_null(json!(tmpfs), tmpfs.is_empty()),
+        "Volumes": or_null(json!(volumes), volumes.is_empty()),
+    })
+}
+
 fn volume_json(v: &super::volumes::Volume) -> Value {
     json!({
         "Name": v.name,
@@ -2361,6 +2415,7 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         pid_mode,
         mounts: mounts.guest,
         mount_info: mounts.info,
+        mount_request: mount_request(&body, &image_cfg),
         volumes: mounts.volumes,
         anon_volumes: mounts.anon,
         restart: RestartPolicy {
@@ -2693,7 +2748,7 @@ fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
 fn inspect(c: &Container, nets: &[super::network::Network]) -> Value {
     let when = |t: Option<std::time::SystemTime>| t.map_or_else(|| time::ZERO.to_owned(), time::rfc3339);
     let argv = c.argv();
-    json!({
+    let mut v = json!({
         "Id": c.id,
         "Created": time::rfc3339(c.created),
         "Path": argv.first().cloned().unwrap_or_default(),
@@ -2773,7 +2828,14 @@ fn inspect(c: &Container, nets: &[super::network::Network]) -> Value {
         },
         "NetworkSettings": network_settings(c, nets),
         "Mounts": c.spec.mount_info,
-    })
+    });
+    // Set apart: one more key in the macro above passes its recursion limit.
+    let mounts = inspect_mounts(&c.spec);
+    v["Config"]["Volumes"] = mounts["Volumes"].clone();
+    for key in ["Binds", "Mounts", "Tmpfs"] {
+        v["HostConfig"][key] = mounts[key].clone();
+    }
+    v
 }
 
 fn network_settings(c: &Container, nets: &[super::network::Network]) -> Value {
@@ -5005,6 +5067,105 @@ mod network_option_tests {
         assert!(message.starts_with("No such image: demo:nosuch"));
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Creates a container from `body` (on an image with a VOLUME line) and
+    /// returns its inspect, as `docker inspect` shows it.
+    fn inspect_after_create(name: &str, body: Value) -> Value {
+        let dir = std::env::temp_dir().join(format!("kiri-inspect-mounts-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({"created": "2026-11-20T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"], "Volumes": {"/var/lib/img": {}}}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:local".into(), &digest, &cfg, Vec::new())).unwrap();
+        let mut body = body;
+        body["Image"] = json!("demo:local");
+        let id = super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&body).unwrap()), &engine).unwrap()["Id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let v = container_inspect(&engine, &id).unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+        v
+    }
+
+    /// `-v` and Compose's short syntax arrive as Binds, `--mount` and the
+    /// long syntax as Mounts, `--tmpfs` as Tmpfs. Docker gives each back as
+    /// it came, and tools that recreate a container (Watchtower, Portainer)
+    /// copy HostConfig: without them the new container has no volumes (#610).
+    #[test]
+    fn inspect_gives_back_binds_mounts_and_tmpfs_as_created() {
+        let src = std::env::temp_dir().join(format!("kiri-inspect-src-{}", std::process::id()));
+        std::fs::create_dir_all(&src).unwrap();
+        let src = src.to_str().unwrap().to_owned();
+        let binds = json!([format!("{src}:/b:ro"), "k610vol:/data:rw"]);
+        let mounts = json!([
+            {"Type": "bind", "Source": src, "Target": "/b2", "ReadOnly": true},
+            {"Type": "volume", "Source": "k610other", "Target": "/data2", "VolumeOptions": {"NoCopy": true}},
+            {"Type": "volume", "Target": "/anon2", "VolumeOptions": {}},
+            {"Type": "tmpfs", "Target": "/t", "TmpfsOptions": {"SizeBytes": 1048576}},
+        ]);
+        let tmpfs = json!({"/t2": "size=2m"});
+        let v = inspect_after_create("given", json!({"HostConfig": {"Binds": binds, "Mounts": mounts, "Tmpfs": tmpfs}}));
+        assert_eq!(v["HostConfig"]["Binds"], binds);
+        assert_eq!(v["HostConfig"]["Mounts"], mounts);
+        assert_eq!(v["HostConfig"]["Tmpfs"], tmpfs);
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    /// With no mounts asked for, Docker shows none.
+    #[test]
+    fn inspect_without_mounts_shows_none() {
+        let v = inspect_after_create("none", json!({"HostConfig": {}}));
+        assert_eq!(v["HostConfig"]["Binds"], Value::Null);
+        assert_eq!(v["HostConfig"]["Mounts"], Value::Null);
+        assert_eq!(v["HostConfig"]["Tmpfs"], Value::Null);
+    }
+
+    /// `-v /path` arrives in Config.Volumes; Docker's inspect lists it there
+    /// with the image's VOLUME lines, so a recreate gets them again.
+    #[test]
+    fn inspect_lists_anonymous_volumes_in_config_volumes() {
+        let v = inspect_after_create("anon", json!({"Volumes": {"/anon": {}}, "HostConfig": {}}));
+        assert_eq!(v["Config"]["Volumes"], json!({"/anon": {}, "/var/lib/img": {}}));
+    }
+
+    /// A container saved before the request was kept has only Docker's
+    /// `Mounts` entries: its Binds, Tmpfs and anonymous volumes are made
+    /// from those, so a recreate still keeps its data.
+    #[test]
+    fn inspect_of_an_older_container_derives_its_mounts() {
+        let root = std::env::temp_dir().join(format!("kiri-inspect-older-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        let image = kiri_image::Image { mirror: None,
+            name: "older:1".into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
+            layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
+        };
+        let spec: super::super::engine::Spec = serde_json::from_value(json!({
+            "image": image.name, "image_id": image.config_digest, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}, "volumes": ["named"], "anon_volumes": ["0123abcd"],
+            "mount_info": [
+                {"Type": "bind", "Source": "/Users/me/src", "Destination": "/src", "Mode": "", "RW": false, "Propagation": "rprivate"},
+                {"Type": "volume", "Name": "named", "Source": "/v/named", "Destination": "/data", "Driver": "local", "Mode": "z", "RW": true, "Propagation": ""},
+                {"Type": "volume", "Name": "0123abcd", "Source": "/v/0123abcd", "Destination": "/anon", "Driver": "local", "Mode": "z", "RW": true, "Propagation": ""},
+                {"Type": "tmpfs", "Source": "", "Destination": "/t", "Mode": "", "RW": true, "Propagation": ""},
+            ],
+        })).unwrap();
+        let id = engine.create(Some("older".into()), spec, &image).unwrap();
+        let v = container_inspect(&engine, &id).unwrap();
+        assert_eq!(v["HostConfig"]["Binds"], json!(["/Users/me/src:/src:ro", "named:/data"]));
+        assert_eq!(v["HostConfig"]["Mounts"], Value::Null);
+        assert_eq!(v["HostConfig"]["Tmpfs"], json!({"/t": ""}));
+        assert_eq!(v["Config"]["Volumes"], json!({"/anon": {}}));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
