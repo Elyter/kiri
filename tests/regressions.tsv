@@ -317,3 +317,4 @@ tests/ui/watch-bind-mounts.js	#487	Settings -> Resources had no toggle on Window
 crates/kiri/src/client.rs	#836	Linux client socket discovery missed WSL 2 integration sockets under /mnt/wsl/kiri/sockets/<distro>/docker.sock (and /var/run/docker.sock symlinks to them) and reported socket EACCES as "Kiri isn't running"
 crates/kiri/src/daemon/mod.rs	#836	non-root kiri daemon on Linux bound ~/.kiri/run/docker.sock instead of failing fast, and sudo kiri daemon did not fall back to the kiri group, grant SUDO_UID POSIX ACL access, or link /run/docker.sock when free
 crates/kiri/src/docker.rs	#836	kiri docker subcommands reported socket permission errors and Linux/WSL not-running errors with the macOS `kiri daemon` message instead of OS-accurate guidance
+crates/kiri-image/src/store.rs	#864	an image put under a name another image had (commit, build, pull, load, tag) dropped the old record but left its blobs in the store, where nothing could remove them

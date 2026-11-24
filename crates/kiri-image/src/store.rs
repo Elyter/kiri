@@ -464,13 +464,18 @@ impl Store {
         Ok(self.images()?.into_iter().find(|i| i.name == name || i.digest == name || r.as_ref().is_some_and(|r| i.matches(r))))
     }
 
-    /// Adds `image`, replacing any image with the same name.
+    /// Adds `image`, replacing any image with the same name. The blobs only
+    /// the replaced image used go, as [`Store::remove_image`] deletes them:
+    /// nothing would name them any more (#864).
     pub fn put_image(&self, image: Image) -> io::Result<()> {
         let _lock = self.lock_index()?;
-        let mut images = self.read_locked()?;
-        images.retain(|i| i.name != image.name);
+        let (replaced, mut images): (Vec<Image>, Vec<Image>) = self.read_locked()?.into_iter().partition(|i| i.name == image.name);
         images.push(image);
-        self.write_index(&images)
+        self.write_index(&images)?;
+        for old in &replaced {
+            self.remove_unused_blobs(old, &images);
+        }
+        Ok(())
     }
 
     /// Records the manifest a push of `name` left in its registry, so
@@ -506,13 +511,20 @@ impl Store {
         let Some(pos) = images.iter().position(|i| i.name == name) else { return Ok(None) };
         let removed = images.remove(pos);
         self.write_index(&images)?;
+        self.remove_unused_blobs(&removed, &images);
+        Ok(Some(removed))
+    }
+
+    /// Deletes the blobs of `gone` that no image in `images` uses and
+    /// nothing holds ([`Store::pin`]). Called with the index lock held,
+    /// once `images` is written.
+    fn remove_unused_blobs(&self, gone: &Image, images: &[Image]) {
         let in_use = |d: &str| images.iter().any(|i| i.referenced_digests().any(|r| r == d));
-        for d in removed.referenced_digests() {
+        for d in gone.referenced_digests() {
             if !in_use(d) {
                 self.remove_unpinned(d);
             }
         }
-        Ok(Some(removed))
     }
 
     /// Deletes the blob `digest` if no image uses it and nothing holds it,
@@ -791,6 +803,65 @@ mod tests {
         assert!(store.has_blob(&cfg, cfg_sz) && store.has_blob(&man, man_sz) && store.has_blob(&idx, idx_sz), "second tag still holds all blobs");
         store.remove_image("app:latest").unwrap();
         assert!(!store.has_blob(&cfg, cfg_sz) && !store.has_blob(&man, man_sz) && !store.has_blob(&idx, idx_sz), "last tag frees raw manifest and index blobs");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An image put under a name another image had (a commit, build, pull,
+    /// load or tag onto it) takes that image's place, and the blobs only the
+    /// old one used go as `remove_image` would delete them. Before, they
+    /// stayed with no image naming them and nothing could remove them (#864).
+    #[test]
+    fn an_image_put_under_a_taken_name_frees_the_blobs_only_the_old_one_used() {
+        let root = std::env::temp_dir().join(format!("kiri-store-replace-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        let put = |bytes: &[u8]| {
+            let mut w = store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let layer = |(digest, size): &(String, u64)| Layer { digest: digest.clone(), size: *size, media_type: "application/vnd.oci.image.layer.v1.tar".into() };
+        let (shared, old_layer, new_layer) = (put(b"base layer"), put(b"layer of the first build"), put(b"layer of the second build"));
+        let (old_cfg, new_cfg) = (put(b"{\"created\":\"first\"}"), put(b"{\"created\":\"second\"}"));
+        let (old_man, pinned_layer) = (put(b"{\"schemaVersion\":2,\"first\":true}"), put(b"layer a save is still sending"));
+        let img = |name: &str, cfg: &(String, u64), manifest: Option<&(String, u64)>, layers: &[&(String, u64)]| Image {
+            name: name.into(),
+            digest: manifest.map_or_else(|| cfg.0.clone(), |m| m.0.clone()),
+            index_digest: None,
+            config_digest: cfg.0.clone(),
+            layers: layers.iter().map(|l| layer(l)).collect(),
+            size: 0,
+            platform: "linux/amd64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: RunConfig::default(),
+            mirror: None,
+        };
+        let has = |(digest, size): &(String, u64)| store.has_blob(digest, *size);
+
+        // The old image under a second name keeps all its blobs.
+        store.put_image(img("app:latest", &old_cfg, Some(&old_man), &[&shared, &old_layer])).unwrap();
+        store.put_image(img("app:v1", &old_cfg, Some(&old_man), &[&shared, &old_layer])).unwrap();
+        store.put_image(img("app:latest", &new_cfg, None, &[&shared, &new_layer])).unwrap();
+        assert!(has(&old_cfg) && has(&old_man) && has(&old_layer), "app:v1 still names the old image");
+
+        // Its last name taken: its own config, manifest and layer go; the
+        // shared layer and the new image's blobs stay.
+        store.put_image(img("app:v1", &new_cfg, None, &[&shared, &new_layer])).unwrap();
+        assert!(!has(&old_cfg) && !has(&old_man) && !has(&old_layer), "nothing names the old image's blobs any more");
+        assert!(has(&shared) && has(&new_cfg) && has(&new_layer), "the new image uses these");
+
+        // Putting the same image again under its own name deletes nothing.
+        store.put_image(img("app:v1", &new_cfg, None, &[&shared, &new_layer])).unwrap();
+        assert!(has(&shared) && has(&new_cfg) && has(&new_layer));
+
+        // A blob something still holds outlives the replacement.
+        store.put_image(img("held:1", &old_cfg, None, &[&pinned_layer])).unwrap();
+        let pin = store.pin(&pinned_layer.0);
+        store.put_image(img("held:1", &new_cfg, None, &[&new_layer])).unwrap();
+        assert!(has(&pinned_layer), "a pin still holds it");
+        drop(pin);
+        assert_eq!(store.images().unwrap().iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["app:latest", "app:v1", "held:1"]);
         fs::remove_dir_all(&root).unwrap();
     }
 

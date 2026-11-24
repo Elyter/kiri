@@ -13,6 +13,12 @@ A log of every merged bug fix in Kiri, newest first, together with any later bug
 
 ## Fixes
 
+### #864 Images: an image put under a taken name frees the blobs only the old one used (unreleased)
+- Fixes: #864 An image replaced under its name disappears, but its blobs stay on the Mac and nothing can remove them
+- Caused: none known
+- Caused by: -
+- Check: `crates/kiri-image/src/store.rs`
+
 ### #836 CLI & Daemon: discover WSL 2 integration sockets, fail fast on non-root Linux daemon, grant invoking sudo user access, and distinguish socket permission errors (unreleased)
 - Fixes: #836 Kiri isn't running. Open Kiri, or start it with `kiri daemon`
 - Caused: none known
